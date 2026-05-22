@@ -1,434 +1,296 @@
 #include <Wire.h>
-#include <AFMotor_R4.h>
 #include <LiquidCrystal_I2C.h>
 #include <MPU6050.h>
 
-AF_DCMotor motorL(1);
-AF_DCMotor motorR(2);
+#define MOTOR_LEFT_STEP 2
+#define MOTOR_LEFT_DIR 5
+#define MOTOR_RIGHT_STEP 3
+#define MOTOR_RIGHT_DIR 6
+#define ENABLE_PIN 8
+
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 MPU6050 mpu;
 
-// ===================================================
-// CẤU HÌNH GRID SEARCH (Lược SOFT - Vùng nhẹ)
-// ===================================================
-const float KP_SOFT_START = 4.0;
-const float KP_SOFT_END   = 10.0;
-const float KP_SOFT_STEP  = 1.0;
-
-const float KD_SOFT_START = 0.5;
-const float KD_SOFT_END   = 2.0;
-const float KD_SOFT_STEP  = 0.25;
-
-const float KI_SOFT_FIXED = 0.4;
-
-// ===================================================
-// CẤU HÌNH GRID SEARCH (Lược HARD - Vùng lớn)
-// ===================================================
-const float KP_HARD_START = 14.0;
-const float KP_HARD_END   = 22.0;
-const float KP_HARD_STEP  = 1.0;
-
-const float KD_HARD_START = 2.5;
-const float KD_HARD_END   = 4.0;
-const float KD_HARD_STEP  = 0.25;
-
-const float KI_HARD_FIXED = 0.8;
-
-// Thời gian chạy test cho mỗi bộ số (ms)
-const unsigned long TEST_TIME = 4000; 
-
-// ===================================================
-// CẤU HÌNH ROBOT
-// ===================================================
+const float ALPHA = 0.90;            // Bộ lọc bù độ nhạy cao
 float setpoint = 0.0;
+const float INTEGRAL_LIMIT = 50.0;   
+const float FALL_ANGLE = 25.0;   
 
-const float INTEGRAL_LIMIT  = 50.0;
-const int   MAX_SPEED        = 255;
-const float DEAD_ZONE        = 0.3;  
-const int   MOTOR_DEADBAND   = 40;   // Bù ma sát tĩnh trực tiếp trên PWM
-const float FALL_ANGLE       = 25.0;
-const float ALPHA            = 0.98;
-const float SCHEDULE_ANGLE     = 3.0;   // Chuyển vùng tại 3 độ
-const float SCHEDULE_HYSTERESIS = 0.5;  // Hysteresis
-
+// Đảo chiều phần cứng nếu xe chạy ngược hướng đổ (Đổi true/false nếu cần)
 const bool INVERT_LEFT  = true;
-const bool INVERT_RIGHT = true;
+const bool INVERT_RIGHT = true; 
 const bool INVERT_ANGLE = true;
 
 // ===================================================
-// BIẾN RUNTIME
+// DẢI QUÉT TUNING MỚI - TĂNG KP BẮT ĐẦU TỪ 200
 // ===================================================
-float angle        = 0.0;
-float zeroOffset   = 0.0;
+const float KP_START = 600.0;  // Bắt đầu từ 200 theo yêu cầu của bạn
+const float KP_END   = 800.0;  // Tăng trần lên 400 để dải quét rộng hơn
+const float KP_STEP  = 40.0;
+
+const float KD_START = 130.0;   // Tăng nhẹ KD nền để tương thích với KP lớn
+const float KD_END   = 200.0;   
+const float KD_STEP  = 6.0;
+
+const float KI_FIXED = 2.0;     
+const unsigned long TEST_TIME_PER_SET = 3000; // Thời gian test mỗi cặp tham số (ms)
+
+// Biến điều khiển hệ thống
+float angle = 0.0;
+float zeroOffset = 0.0;
 float integralTerm = 0.0;
-float lastError    = 0.0;
-float lastDeriv    = 0.0;
-bool aggressiveMode = false;
-unsigned long lastTime = 0;
 int16_t gyroXoffset = 0;
+float globalGyroRate = 0.0;
 
-// Lưu kết quả tối ưu nhất
-float bestKp_Soft    = 0;
-float bestKd_Soft    = 0;
-float bestScore_Soft = 999999.0;
+// Máy trạng thái Tuning
+enum TuningState { STATE_WAIT_VERTICAL, STATE_COUNTDOWN, STATE_RUNNING, STATE_DONE };
+TuningState currentState = STATE_WAIT_VERTICAL;
 
-float bestKp_Hard    = 0;
-float bestKd_Hard    = 0;
-float bestScore_Hard = 999999.0;
+float currentKp = KP_START;
+float currentKd = KD_START;
+unsigned long stateTimer = 0;
+float currentScore = 0;
+int countdownCount = 0;
 
-// Khai báo các hàm chức năng
+float bestKp = 0.0; 
+float bestKd = 0.0; 
+float bestScore = 999999.0;
+
 void calibrateMPU();
 void calibrateZeroAngle();
-void driveMotors(float control);
-void stopMotors();
-float readAngle();
-float testPID(float testKp, float testKi, float testKd, bool &isFallen);
-void waitRobotToBeVertical();
+void setMotorSpeeds(float leftControl, float rightControl);
+void moveToNextParam();
+float updateAngle(float dt);
 
-// ===================================================
 void setup() {
   Serial.begin(115200);
   Wire.begin();
+  Wire.setClock(400000); // Tăng tốc độ I2C để đọc dữ liệu MPU nhanh nhất
+  
+  pinMode(MOTOR_LEFT_STEP, OUTPUT);
+  pinMode(MOTOR_LEFT_DIR, OUTPUT);
+  pinMode(MOTOR_RIGHT_STEP, OUTPUT);
+  pinMode(MOTOR_RIGHT_DIR, OUTPUT);
+  pinMode(ENABLE_PIN, OUTPUT);
+  digitalWrite(ENABLE_PIN, LOW); // Bật Driver
 
   lcd.init();
   lcd.backlight();
   lcd.clear();
-  lcd.setCursor(0, 0); lcd.print("Grid Search PID");
-  lcd.setCursor(0, 1); lcd.print("Initializing...");
-
-  stopMotors();
+  lcd.setCursor(0, 0); lcd.print("Tuning Kp>=200");
 
   mpu.initialize();
   if (!mpu.testConnection()) {
-    lcd.clear();
-    lcd.setCursor(0, 0); lcd.print("MPU6050 ERROR!");
+    lcd.clear(); lcd.print("MPU6050 ERROR!");
     while (1) delay(100);
   }
-
-  // Cân bằng cảm biến tĩnh
   calibrateMPU();
 
-  // Khởi tạo góc ban đầu từ gia tốc trọng trường
-  int16_t ax, ay, az, gx, gy, gz;
-  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-  angle = atan2((float)ay, (float)az) * 180.0 / PI;
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+  angle = atan2((float)ax, (float)az) * 180.0 / PI;
   if (INVERT_ANGLE) angle = -angle;
-
-  // Hiệu chuẩn góc zero từ vị trí đứng thẳng
   calibrateZeroAngle();
 
-  // ===================================================
-  // GRID SEARCH - VÙNG SOFT
-  // ===================================================
-  Serial.println("\n================================================");
-  Serial.println("TUNING SOFT PID (Vùng gần 0 độ)");
-  Serial.println("Kp     | Kd     | SCORE    | STATUS");
-  Serial.println("================================================");
+  Serial.println("\n========================================================");
+  Serial.println("  START GRID SEARCH TUNING - Kp BẮT ĐẦU TỪ 200.0");
+  Serial.println("========================================================");
 
-  int testNum = 0;
-  int totalTests_Soft = ((KP_SOFT_END - KP_SOFT_START) / KP_SOFT_STEP + 1) *
-                        ((KD_SOFT_END - KD_SOFT_START) / KD_SOFT_STEP + 1);
-  int totalTests_Hard = ((KP_HARD_END - KP_HARD_START) / KP_HARD_STEP + 1) *
-                        ((KD_HARD_END - KD_HARD_START) / KD_HARD_STEP + 1);
-
-  // for (float testKp = KP_SOFT_START; testKp <= KP_SOFT_END + 0.01; testKp += KP_SOFT_STEP) {
-  //   for (float testKd = KD_SOFT_START; testKd <= KD_SOFT_END + 0.01; testKd += KD_SOFT_STEP) {
-  //     testNum++;
-
-  //     if (testNum < 39) continue;
-
-  //     waitRobotToBeVertical();
-
-  //     lcd.clear();
-  //     lcd.setCursor(0, 0);
-  //     lcd.print("Soft "); lcd.print(testNum); lcd.print("/"); lcd.print(totalTests_Soft);
-  //     lcd.setCursor(0, 1);
-  //     lcd.print("Kp:"); lcd.print(testKp, 1); lcd.print(" Kd:"); lcd.print(testKd, 2);
-
-  //     Serial.print("Kp="); Serial.print(testKp, 1);
-  //     Serial.print(" | Kd="); Serial.print(testKd, 2);
-  //     Serial.print(" -> ");
-
-  //     bool isFallen = false;
-  //     float score = testPID(testKp, KI_SOFT_FIXED, testKd, isFallen);
-
-  //     Serial.print("Score="); Serial.print(score, 1);
-
-  //     if (!isFallen && score < bestScore_Soft) {
-  //       bestScore_Soft = score;
-  //       bestKp_Soft    = testKp;
-  //       bestKd_Soft    = testKd;
-  //       Serial.print(" *** TOT NHAT ***");
-  //     }
-
-  //     if (isFallen) Serial.print(" [NGA]");
-  //     Serial.println();
-
-  //     stopMotors();
-  //   }
-  // }
-
-  // ===================================================
-  // GRID SEARCH - VÙNG HARD
-  // ===================================================
-  Serial.println("\n================================================");
-  Serial.println("TUNING HARD PID (Vùng cứu đổ > 3 độ)");
-  Serial.println("Kp     | Kd     | SCORE    | STATUS");
-  Serial.println("================================================");
-
-  testNum = 0;
-
-  for (float testKp = KP_HARD_START; testKp <= KP_HARD_END + 0.01; testKp += KP_HARD_STEP) {
-    for (float testKd = KD_HARD_START; testKd <= KD_HARD_END + 0.01; testKd += KD_HARD_STEP) {
-      testNum++;
-      
-      if (testNum < 55) continue; // Bỏ qua một số bộ số đầu để tập trung vào vùng có khả năng tốt hơn (theo kết quả từ lần chạy trước)
-      
-      waitRobotToBeVertical();
-
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("Hard "); lcd.print(testNum); lcd.print("/"); lcd.print(totalTests_Hard);
-      lcd.setCursor(0, 1);
-      lcd.print("Kp:"); lcd.print(testKp, 1); lcd.print(" Kd:"); lcd.print(testKd, 2);
-
-      Serial.print("Kp="); Serial.print(testKp, 1);
-      Serial.print(" | Kd="); Serial.print(testKd, 2);
-      Serial.print(" -> ");
-
-      bool isFallen = false;
-      float score = testPID(testKp, KI_HARD_FIXED, testKd, isFallen);
-
-      Serial.print("Score="); Serial.print(score, 1);
-
-      if (!isFallen && score < bestScore_Hard) {
-        bestScore_Hard = score;
-        bestKp_Hard    = testKp;
-        bestKd_Hard    = testKd;
-        Serial.print(" *** TOT NHAT ***");
-      }
-
-      if (isFallen) Serial.print(" [NGA]");
-      Serial.println();
-
-      stopMotors();
-    }
-  }
-
-  // ===================================================
-  // HIỂN THỊ KẾT QUẢ CUỐI CÙNG
-  // ===================================================
-  Serial.println("\n================================================");
-  Serial.println("KET QUA TOT NHAT - SOFT PID:");
-  Serial.print("Kp_Soft = "); Serial.println(bestKp_Soft, 1);
-  Serial.print("Ki_Soft = "); Serial.println(KI_SOFT_FIXED, 1);
-  Serial.print("Kd_Soft = "); Serial.println(bestKd_Soft, 1);
-  Serial.print("Score = "); Serial.println(bestScore_Soft, 1);
-
-  Serial.println("\nKET QUA TOT NHAT - HARD PID:");
-  Serial.print("Kp_Hard = "); Serial.println(bestKp_Hard, 1);
-  Serial.print("Ki_Hard = "); Serial.println(KI_HARD_FIXED, 1);
-  Serial.print("Kd_Hard = "); Serial.println(bestKd_Hard, 1);
-  Serial.print("Score = "); Serial.println(bestScore_Hard, 1);
-  Serial.println("================================================");
-
-  lcd.clear();
-  lcd.setCursor(0, 0); lcd.print("DONE! Copy PID:");
-  lcd.setCursor(0, 1);
-  lcd.print("S:"); lcd.print(bestKp_Soft, 0); lcd.print(" H:"); lcd.print(bestKp_Hard, 0);
-
-  while (1) {
-    delay(100);
-  }
+  stateTimer = millis();
 }
 
 void loop() {
-  // Không dùng vòng loop chính, toàn bộ tiến trình chạy một lần trong setup()
-}
-
-// ===================================================
-// Hàm đọc góc thô phục vụ khởi tạo hoặc đồng bộ nhanh
-// ===================================================
-float readAngle() {
-  int16_t ax, ay, az, gx, gy, gz;
-  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-  float a = atan2((float)ay, (float)az) * 180.0 / PI;
-  if (INVERT_ANGLE) a = -a;
-  return a;
-}
-
-// ===================================================
-// Hàm khóa tiến trình, đợi người dùng dựng xe đứng thẳng
-// ===================================================
-void waitRobotToBeVertical() {
-  stopMotors();
-  lcd.clear();
-  lcd.setCursor(0, 0); lcd.print("DUNG XE THANG!");
+  static unsigned long lastPIDTime = 0;
+  unsigned long now = millis();
   
-  float currentAngle = readAngle();
-  
-  // Đợi cho đến khi góc lệch so với điểm setpoint nhỏ hơn 2 độ
-  while (fabs(currentAngle - setpoint) > 2.0) {
-    currentAngle = readAngle();
-    lcd.setCursor(0, 1);
-    lcd.print("Goc hien tai: "); lcd.print(currentAngle, 1); lcd.print("  ");
-    delay(200);
+  // Chu kỳ PID chạy cố định 10ms (100Hz)
+  if (now - lastPIDTime < 10) return; 
+  float dt = (now - lastPIDTime) / 1000.0;
+  lastPIDTime = now;
+
+  float calibratedAngle = updateAngle(dt);
+
+  switch (currentState) {
+    case STATE_WAIT_VERTICAL:
+      setMotorSpeeds(0, 0);
+      if (fabs(calibratedAngle - setpoint) < 0.8) {
+        currentState = STATE_COUNTDOWN;
+        stateTimer = millis();
+        countdownCount = 2; 
+      } else {
+        static unsigned long lcdPrintTimer = 0;
+        if (millis() - lcdPrintTimer > 200) {
+          lcdPrintTimer = millis();
+          lcd.clear();
+          lcd.setCursor(0, 0); lcd.print("GIU XE THANG!");
+          lcd.setCursor(0, 1); lcd.print("Goc: "); lcd.print(calibratedAngle, 1);
+        }
+      }
+      break;
+
+    case STATE_COUNTDOWN:
+      setMotorSpeeds(0, 0);
+      if (fabs(calibratedAngle - setpoint) > 1.5) {
+        currentState = STATE_WAIT_VERTICAL;
+        break;
+      }
+      if (millis() - stateTimer >= 1000) {
+        stateTimer = millis();
+        countdownCount--;
+        if (countdownCount <= 0) {
+          integralTerm = 0; currentScore = 0;
+          lcd.clear();
+          lcd.setCursor(0, 0); lcd.print("REALTIME TUNING");
+          lcd.setCursor(0, 1); lcd.print("P:"); lcd.print(currentKp,0); lcd.print(" D:"); lcd.print(currentKd,1);
+          
+          currentState = STATE_RUNNING;
+          stateTimer = millis(); 
+        } else {
+          lcd.clear();
+          lcd.setCursor(0, 0); lcd.print("BUONG TAY SAU...");
+          lcd.setCursor(0, 1); lcd.print(countdownCount); lcd.print("s");
+        }
+      }
+      break;
+
+    case STATE_RUNNING:
+      if (fabs(calibratedAngle - setpoint) > FALL_ANGLE) {
+        Serial.print("Kp="); Serial.print(currentKp, 1); 
+        Serial.print(" | Kd="); Serial.print(currentKd, 1); 
+        Serial.println(" -> [XE NGÃ]");
+        moveToNextParam();
+        break;
+      }
+
+      if (millis() - stateTimer >= TEST_TIME_PER_SET) {
+        Serial.print("Kp="); Serial.print(currentKp, 1);
+        Serial.print(" | Kd="); Serial.print(currentKd, 1);
+        Serial.print(" -> ĐẠT! Score: "); Serial.println(currentScore, 2);
+
+        if (currentScore < bestScore) {
+          bestScore = currentScore; 
+          bestKp = currentKp; 
+          bestKd = currentKd;
+        }
+        moveToNextParam();
+        break;
+      }
+
+      {
+        float error = calibratedAngle - setpoint;
+        integralTerm += error * dt;
+        integralTerm = constrain(integralTerm, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+
+        float deriv = globalGyroRate; 
+
+        float control = (currentKp * error) + (KI_FIXED * integralTerm) + (currentKd * deriv);
+        
+        setMotorSpeeds(control, control);
+        currentScore += (fabs(error) * dt);
+      }
+      break;
+
+    case STATE_DONE:
+      setMotorSpeeds(0, 0);
+      break;
   }
-  
-  // Xe đã thẳng đứng, đếm ngược ngắn chuẩn bị thả tay
-  for (int i = 2; i > 0; i--) {
-    lcd.clear();
-    lcd.setCursor(0, 0); lcd.print("Chuan bi tha...");
-    lcd.setCursor(0, 1); lcd.print(i); lcd.print("s");
-    delay(1000);
-  }
 }
 
 // ===================================================
-// Hàm chạy thử nghiệm 1 bộ số PID
-// Trả về điểm phạt (Càng thấp càng tốt)
+// HÀM CẬP NHẬT GÓC NGHIÊNG
 // ===================================================
-float testPID(float testKp, float testKi, float testKd, bool &isFallen) {
-  float score       = 0;
-  float intTerm     = 0;
-  float lError      = 0;
-  float lDeriv      = 0;
-  float localAngle  = readAngle(); // Đồng bộ góc ban đầu sát thực tế nhất
+float updateAngle(float dt) {
+  int16_t ax, ay, az, gx;
+  mpu.getAcceleration(&ax, &ay, &az);
+  gx = mpu.getRotationX();
+
+  float accAngle = atan2((float)ax, (float)az) * 180.0 / PI;
+  globalGyroRate = ((float)gx - gyroXoffset) / 131.0;
   
-  unsigned long start = millis();
-  unsigned long lTime = start;
-
-  while (millis() - start < TEST_TIME) {
-    unsigned long now = millis();
-    float dt = (now - lTime) / 1000.0;
-    lTime = now;
-    if (dt <= 0 || dt > 0.1) dt = 0.01;
-
-    // Đọc dữ liệu cảm biến
-    int16_t ax, ay, az, gx, gy, gz;
-    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-
-    float accAngle = atan2((float)ay, (float)az) * 180.0 / PI;
-    float gyroRate = ((float)gx - gyroXoffset) / 131.0;
-    if (INVERT_ANGLE) { 
-      accAngle = -accAngle; 
-      gyroRate = -gyroRate; 
-    }
-
-    // Bộ lọc bù kết hợp Gia tốc và Tốc độ góc
-    localAngle = ALPHA * (localAngle + gyroRate * dt) + (1.0 - ALPHA) * accAngle;
-
-    // Áp dụng zero offset (hiệu chuẩn)
-    float calibratedAngle = localAngle - zeroOffset;
-
-    // Nếu xe nghiêng vượt ngưỡng cho phép -> Xác định ngã -> Dừng khẩn cấp
-    if (fabs(calibratedAngle - setpoint) > FALL_ANGLE) {
-      stopMotors();
-      isFallen = true;
-      return 999999.0; // Trả về điểm phạt cực lớn
-    }
-
-    // Tính toán sai số
-    float error = calibratedAngle - setpoint;
-
-    // Thành phần Tích phân (I)
-    intTerm += error * dt;
-    intTerm  = constrain(intTerm, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
-
-    // Thành phần Vi phân (D) tích hợp bộ lọc nhiễu tần số cao (Low-pass filter)
-    float rawDeriv = (error - lError) / dt;
-    lDeriv = 0.7 * lDeriv + 0.3 * rawDeriv;
-    lError = error;
-
-    // Tổng hợp lực điều khiển
-    float control = (testKp * error) + (testKi * intTerm) + (testKd * lDeriv);
-
-    // Xuất tín hiệu điều khiển động cơ
-    driveMotors(control);
-
-    // Thuật toán chấm điểm tối ưu (IAE + Phạt vận tốc điều khiển để xe hạn chế phóng nhanh)
-    score += (fabs(error) * dt) + (fabs(control) * 0.002 * dt);
-
-    delay(10); // Tạo khoảng nghỉ ngắn để chu kỳ lấy mẫu dt ổn định quanh mức 10ms
+  if (INVERT_ANGLE) { 
+    accAngle = -accAngle; 
+    globalGyroRate = -globalGyroRate; 
   }
 
-  stopMotors();
-  return score;
+  angle = ALPHA * (angle + globalGyroRate * dt) + (1.0 - ALPHA) * accAngle;
+  return angle - zeroOffset;
 }
 
 // ===================================================
-// Hàm điều khiển động cơ mượt, triệt tiêu lỗi giật xung của map()
+// HÀM PHÁT XUNG ĐIỀU TỐC TRỰC TIẾP QUA VÒNG LẶP
 // ===================================================
-void driveMotors(float control) {
-  if (fabs(control) < DEAD_ZONE) {
-    stopMotors();
+void setMotorSpeeds(float leftControl, float rightControl) {
+  if (fabs(leftControl) < 0.5) {
     return;
   }
 
-  int spd = (int)fabs(control);
-  // Bù deadband tĩnh: cộng trực tiếp vào PWM
-  if (spd > 0) {
-    spd += MOTOR_DEADBAND;
-  }
-  if (spd > MAX_SPEED) spd = MAX_SPEED;
+  bool dirL = (leftControl > 0);
+  bool dirR = (rightControl > 0);
 
-  uint8_t dirL = (control > 0) ? FORWARD : BACKWARD;
-  uint8_t dirR = (control > 0) ? FORWARD : BACKWARD;
+  if (INVERT_LEFT)  dirL = !dirL;
+  if (INVERT_RIGHT) dirR = !dirR;
 
-  if (INVERT_LEFT)  dirL = (dirL == FORWARD) ? BACKWARD : FORWARD;
-  if (INVERT_RIGHT) dirR = (dirR == FORWARD) ? BACKWARD : FORWARD;
+  digitalWrite(MOTOR_LEFT_DIR, dirL);
+  digitalWrite(MOTOR_RIGHT_DIR, dirR);
 
-  motorL.setSpeed(spd); motorL.run(dirL);
-  motorR.setSpeed(spd); motorR.run(dirR);
+  // Tính chu kỳ trễ dựa vào lực xuất từ PID
+  long pulseDelay = 1000000 / (fabs(leftControl) * 20);
+  
+  // Chặn đáy ở 400us để xe giật đảo chiều nhanh mà không bị khóa/mất bước động cơ cơ khí
+  pulseDelay = constrain(pulseDelay, 400, 5000); 
+
+  // Tạo 1 chu kỳ xung vuông bằng delay mềm
+  digitalWrite(MOTOR_LEFT_STEP, HIGH);
+  digitalWrite(MOTOR_RIGHT_STEP, HIGH);
+  delayMicroseconds(pulseDelay);
+  digitalWrite(MOTOR_LEFT_STEP, LOW);
+  digitalWrite(MOTOR_RIGHT_STEP, LOW);
+  delayMicroseconds(pulseDelay);
 }
 
-// ===================================================
-// Hàm dừng động cơ an toàn
-// ===================================================
-void stopMotors() {
-  motorL.setSpeed(0); motorL.run(RELEASE);
-  motorR.setSpeed(0); motorR.run(RELEASE);
+void moveToNextParam() {
+  setMotorSpeeds(0, 0);
+  currentKd += KD_STEP;
+  if (currentKd > KD_END) {
+    currentKd = KD_START;
+    currentKp += KP_STEP;
+  }
+
+  if (currentKp > KP_END) {
+    currentState = STATE_DONE;
+    Serial.println("\n========================================================");
+    Serial.println("  QUÁ TRÌNH TỰ ĐỘNG TUNING HOÀN TẤT TUYỆT ĐỐI! ");
+    Serial.print(" => Kp TỐT NHẤT: "); Serial.println(bestKp);
+    Serial.print(" => Kd TỐT NHẤT: "); Serial.println(bestKd);
+    Serial.print(" => Sai số thấp nhất: "); Serial.println(bestScore);
+    Serial.println("========================================================");
+
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print("TUNING DONE!");
+    lcd.setCursor(0, 1); lcd.print("P:"); lcd.print(bestKp,1); lcd.print(" D:"); lcd.print(bestKd,1);
+  } else {
+    currentState = STATE_WAIT_VERTICAL;
+  }
 }
 
 void calibrateZeroAngle() {
-  zeroOffset = angle;
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+  float a = atan2((float)ax, (float)az) * 180.0 / PI;
+  if (INVERT_ANGLE) a = -a;
+  zeroOffset = a;
   angle = 0.0;
-  integralTerm = 0.0;
-  lastError = 0.0;
-  lastDeriv = 0.0;
-
-  lcd.clear();
-  lcd.setCursor(0, 0); lcd.print("Zero calibrated");
-  lcd.setCursor(0, 1); lcd.print("Offset:"); lcd.print(zeroOffset, 2);
-  Serial.print("Zero offset set to: "); Serial.println(zeroOffset, 2);
-  delay(800);
-  lcd.clear();
-  lcd.setCursor(0, 0); lcd.print("Ready to search...");
 }
 
-// ===================================================
-// Hàm lấy mẫu tĩnh loại bỏ sai số lệch (Offset) của Gyro
-// ===================================================
 void calibrateMPU() {
   lcd.clear();
-  lcd.setCursor(0, 0); lcd.print("Calibrating...");
-  lcd.setCursor(0, 1); lcd.print("KEEP STILL!");
-  delay(1500);
-
-  const int samples = 500;
-  long gx_sum = 0;
-  int16_t ax, ay, az, gx, gy, gz;
-
-  for (int i = 0; i < samples; i++) {
-    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-    gx_sum += gx;
-    delay(3);
-  }
-
-  gyroXoffset = (int16_t)(gx_sum / samples);
-  
-  lcd.clear();
-  lcd.setCursor(0, 0); lcd.print("Calib done!");
-  lcd.setCursor(0, 1); lcd.print("Offset X: "); lcd.print(gyroXoffset);
+  lcd.setCursor(0, 0); lcd.print("Calibrating MPU...");
   delay(1000);
+  const int samples = 300;
+  long gx_sum = 0;
+  for (int i = 0; i < samples; i++) {
+    gx_sum += mpu.getRotationX();
+    delay(2);
+  }
+  gyroXoffset = (int16_t)(gx_sum / samples);
 }
