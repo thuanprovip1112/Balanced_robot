@@ -35,6 +35,15 @@ DRV8825 Microstepping (set via jumpers on CNC Shield):
 #define DIR_PIN_R 6   // Y axis DIR
 #define ENABLE_PIN 8  // Shared enable, active LOW
 
+// SRF05 ultrasonic sensor
+#define SRF05_TRIG_PIN      10   // D10 -> TRIG
+#define SRF05_ECHO_PIN      9    // D9  -> ECHO
+// Only measure up to this distance (cm) — caps pulseIn() blocking time
+// 100cm -> max blocking = 100*58 = 5800us (~5.8ms) every SRF05_INTERVAL_MS
+#define SRF05_MAX_CM        400
+#define SRF05_TIMEOUT_US    ((long)SRF05_MAX_CM * 58L)
+#define SRF05_INTERVAL_MS   100   // Read sensor every 100ms
+
 // LCD I2C
 // Common addresses: 0x27 (PCF8574T) or 0x3F (PCF8574AT)
 // Run an I2C scanner sketch if unsure which address your module uses
@@ -48,17 +57,22 @@ DRV8825 Microstepping (set via jumpers on CNC Shield):
 
 // PID gains - 2-level gain scheduling
 // LOW: |error| < GAIN_SWITCH_ANGLE  -> near balance, soft response, less jitter
-float Kp_low = 1900.0f;
-float Ki_low = 80.0f;
-float Kd_low = 150.0f;
+float Kp_low = 1800.0f;
+float Ki_low = 120.0f;
+float Kd_low = 259.0f;
 
 // HIGH: |error| >= GAIN_SWITCH_ANGLE -> far from balance, aggressive recovery
-float Kp_high = 4000.0f;
-float Ki_high = 120.0f;
-float Kd_high = 350.0f;
+float Kp_high = 4200.0f;
+float Ki_high = 180.0f;
+float Kd_high = 500.0f;
 
 // Angle threshold to switch between LOW and HIGH gains (degrees)
-#define GAIN_SWITCH_ANGLE 2.0f
+#define GAIN_SWITCH_ANGLE 1.1f
+
+// Hysteresis band to prevent oscillation between gain modes (degrees)
+// HIGH: |error| > GAIN_SWITCH_ANGLE + HYSTERESIS_BAND
+// LOW:  |error| < GAIN_SWITCH_ANGLE - HYSTERESIS_BAND
+#define HYSTERESIS_BAND 0.5f
 
 // Balance point: angle where robot is truly vertical
 // Set to 0.0, run, observe which way robot falls, adjust by +/-1 steps
@@ -81,13 +95,13 @@ float setpoint = 0.0f;
 
 // Max motor speed in steps/sec
 // DRV8825 + NEMA17 base: 2000 steps/sec at 1/8 -> scales with MICROSTEP
-#define MAX_SPEED (500 * MICROSTEP)
+#define MAX_SPEED (1000 * MICROSTEP)
 
 // Anti-windup clamp for integral term
 #define INTEGRAL_LIMIT 300.0f
 
 // Disable motors if robot tilts beyond this angle (fallen over)
-#define FALL_ANGLE 45.0f
+#define FALL_ANGLE 30.0f
 
 // PID update interval in milliseconds (10ms = 100Hz)
 #define PID_INTERVAL_MS 10
@@ -95,12 +109,29 @@ float setpoint = 0.0f;
 // Right motor direction flip (set true if right motor spins wrong way)
 #define REVERSE_RIGHT true
 
-// ---- Position hold ----
-// Outer P-loop: converts net displacement (steps) to setpoint angle nudge
-// Too large -> robot oscillates back-and-forth; start at 0.002 and increase slowly
-#define POS_HOLD_GAIN 0.006f
-// Max angle correction the position loop can demand (degrees)
-#define POS_HOLD_MAX 1.0f
+// Wheel diameter (mm) — used to convert step count to real distance
+// Measure your wheel's outer diameter and update this value
+#define WHEEL_DIAMETER_MM   65.0f
+
+// ---- Return to home (outer PI cascade) ----
+// Controls the robot's position by nudging the balance setpoint.
+// P: immediate lean proportional to distance from home
+// I: slowly builds lean to overcome friction and steady-state drift
+// Both gains are in degrees/cm (P) and degrees/(cm*s) (I)
+#define HOME_KP         0.01f  // smaller = smoother return (less overshoot/faster speed)
+#define HOME_KI         0.02f  // helps overcome friction; 0 to disable
+#define HOME_I_LIMIT    25.0f   // anti-windup clamp (cm*s)
+#define HOME_MAX_DEG    1.0f    // max angle correction — robot returns home gradually
+
+// ---- Upright detection (startup) ----
+// Set true : robot starts lying flat, lifts to vertical to arm
+// Set false: robot starts already upright, arms immediately after warm-up
+#define LIFT_TO_START       true
+// Robot must rotate this many degrees from its lying angle to be considered upright
+// e.g. lying at ~0 deg, upright at ~90 deg -> set 60 as safe midpoint
+#define UPRIGHT_DELTA_DEG   60.0f
+// Robot must hold upright steadily for this long before PID arms (ms)
+#define UPRIGHT_HOLD_MS     1500
 
 // ============================================================
 // TIMER1 ISR VARIABLES (volatile = shared with interrupt)
@@ -128,6 +159,10 @@ float integral = 0.0f;
 float dFiltered = 0.0f;
 unsigned long lastPIDTime = 0;
 unsigned long lastLCDTime = 0;
+unsigned long lastSRFTime = 0;
+int           distanceCm  = 0;   // Latest SRF05 reading (0 = out of range)
+float         homeIntegral = 0.0f; // Integral for return-to-home PI loop
+bool          useHighGain = false; // Gain scheduling state (HIGH/LOW)
 bool motorsEnabled = false;
 bool hasFallen = false;
 
@@ -204,6 +239,9 @@ void setup() {
   pinMode(STEP_PIN_R, OUTPUT);
   pinMode(DIR_PIN_R, OUTPUT);
   pinMode(ENABLE_PIN, OUTPUT);
+  pinMode(SRF05_TRIG_PIN, OUTPUT);
+  pinMode(SRF05_ECHO_PIN, INPUT);
+  digitalWrite(SRF05_TRIG_PIN, LOW);
 
   // Disable motors during init (DRV8825: HIGH = disabled)
   digitalWrite(ENABLE_PIN, HIGH);
@@ -230,24 +268,22 @@ void setup() {
       ;
   }
 
-  // Calibrate - keep robot perfectly still on flat surface
-  Serial.println("[INFO] Calibrating MPU6050... Do NOT move robot.");
-  lcd.setCursor(0, 0);
-  lcd.print(" Calibrating... ");
-  lcd.setCursor(0, 1);
-  lcd.print(" Do NOT move!   ");
+#if LIFT_TO_START
+  // ── Phase 1: Calibrate GYRO ONLY while flat ──────────────────
+  // Gyro offsets are orientation-independent — safe to calibrate while lying.
+  // We skip accel calibration here; doing it while flat would make 0°=lying
+  // instead of 0°=upright, which would break the PID setpoint.
+  Serial.println("[INFO] Calibrating gyro while flat...");
+  lcd.setCursor(0, 0); lcd.print(" Calibrating... ");
+  lcd.setCursor(0, 1); lcd.print("  Keep flat!    ");
   delay(500);
-  mpu.calcOffsets(true, true);  // Calibrate both gyro and accel
-  Serial.println("[INFO] Calibration done.");
+  mpu.calcOffsets(true, false);   // GYRO ONLY
+  Serial.println("[INFO] Gyro calibrated.");
 
-  // Warm up MPU complementary filter — must loop update() for ~1.5s to converge.
-  // A single mpu.update() right after calcOffsets() gives an inaccurate angle
-  // because the gyro integral hasn't had time to blend with the accelerometer.
-  Serial.println("[INFO] Warming up angle filter... hold robot still.");
-  lcd.setCursor(0, 0);
-  lcd.print(" Warming up...  ");
-  lcd.setCursor(0, 1);
-  lcd.print(" Hold still!    ");
+  // ── Phase 2: Warm up filter, record lying angle as reference ───
+  Serial.println("[INFO] Warming up filter while flat...");
+  lcd.setCursor(0, 0); lcd.print(" Warming up...  ");
+  lcd.setCursor(0, 1); lcd.print("  Keep flat!    ");
   {
     unsigned long t0 = millis();
     while (millis() - t0 < 1500) {
@@ -256,41 +292,137 @@ void setup() {
     }
   }
   smoothedAngle = mpu.getAngleY();
-  Serial.print("[INFO] Settled angle: ");
-  Serial.println(smoothedAngle, 2);
+  float lyingAngle = smoothedAngle;        // Reference: angle when lying
+  Serial.print("[INFO] Lying angle: ");
+  Serial.println(lyingAngle, 2);
+
+  // ── Phase 3: Wait for robot to be lifted upright ────────────────
+  Serial.println("[INFO] Lift robot upright to start!");
+  lcd.setCursor(0, 0); lcd.print(" Lift to START! ");
+  lcd.setCursor(0, 1); lcd.print(" (hold steady)  ");
+  setupTimer1();   // Start ISR now so step-pulse logic is ready when we arm
   {
-    char abuf[8];
-    dtostrf(smoothedAngle, 6, 2, abuf);
-    char lbuf[17];
-    snprintf(lbuf, sizeof(lbuf), "Angle:%s deg ", abuf);
-    lcd.setCursor(0, 0);
-    lcd.print("    Ready!      ");
-    lcd.setCursor(0, 1);
-    lcd.print(lbuf);
+    unsigned long uprightSince = 0;
+    bool uprightDetected = false;
+    while (true) {
+      mpu.update();
+      float ang = mpu.getAngleY();
+      smoothedAngle += ANGLE_LPF_ALPHA * (ang - smoothedAngle);
+
+      bool isUpright = (fabs(smoothedAngle - lyingAngle) > UPRIGHT_DELTA_DEG);
+      if (isUpright) {
+        if (!uprightDetected) {
+          uprightDetected = true;
+          uprightSince    = millis();
+          Serial.println("[INFO] Upright detected, hold steady...");
+          lcd.setCursor(0, 0); lcd.print("Stand detected! ");
+          lcd.setCursor(0, 1); lcd.print(" Hold steady... ");
+        }
+        if (millis() - uprightSince >= UPRIGHT_HOLD_MS) {
+          break;   // Held upright and stable long enough
+        }
+      } else {
+        if (uprightDetected) {
+          uprightDetected = false;
+          Serial.println("[INFO] Lost upright, keep lifting...");
+          lcd.setCursor(0, 0); lcd.print(" Lift to START! ");
+          lcd.setCursor(0, 1); lcd.print(" (hold steady)  ");
+        }
+      }
+      delay(10);
+    }
   }
 
-  // Start Timer1 ISR for step generation
+  // ── Phase 4: Full recalibration at upright position ─────────────
+  // Robot is now vertical and stable. Recalibrate accel+gyro so that
+  // upright = 0° — exactly what the PID setpoint expects.
+  Serial.println("[INFO] Recalibrating at upright...");
+  lcd.setCursor(0, 0); lcd.print(" Recalibrating  ");
+  lcd.setCursor(0, 1); lcd.print("  Stay still!   ");
+  mpu.calcOffsets(true, true);
+  Serial.println("[INFO] Upright calibration done.");
+
+#else
+  // ── LIFT_TO_START disabled: calibrate upright immediately ────────
+  Serial.println("[INFO] Calibrating while upright...");
+  lcd.setCursor(0, 0); lcd.print(" Calibrating... ");
+  lcd.setCursor(0, 1); lcd.print(" Hold upright!  ");
+  delay(500);
+  mpu.calcOffsets(true, true);   // Full calibration at upright
+  Serial.println("[INFO] Calibration done.");
   setupTimer1();
 
-  // Final pre-arm read: seed all filter states so PID has clean initial values
+#endif
+
+  // ── Warm-up / final settle (both modes) ──────────────────────────
+  lcd.setCursor(0, 0); lcd.print(" Warming up...  ");
+  lcd.setCursor(0, 1); lcd.print(" Hold still!    ");
+  {
+    unsigned long t0 = millis();
+    while (millis() - t0 < 500) {
+      mpu.update();
+      delay(5);
+    }
+  }
+  smoothedAngle = mpu.getAngleY();
+  Serial.print("[INFO] Settled angle: ");
+  Serial.println(smoothedAngle, 2);
+  lcd.setCursor(0, 0); lcd.print("    Ready!      ");
+  {
+    char abuf[8]; dtostrf(smoothedAngle, 6, 2, abuf);
+    char lbuf[17]; snprintf(lbuf, sizeof(lbuf), "Angle:%s deg ", abuf);
+    lcd.setCursor(0, 1); lcd.print(lbuf);
+  }
+
+  // ── Phase 5: Arm PID ─────────────────────────────────────────────
   mpu.update();
   smoothedAngle = mpu.getAngleY();
-  prevError = setpoint - smoothedAngle;  // Pre-seed D-term — no derivative kick
-  integral = 0.0f;
+  prevError = setpoint - smoothedAngle;   // Pre-seed D-term — no derivative kick
+  integral  = 0.0f;
   dFiltered = 0.0f;
+  useHighGain = false;  // Reset gain scheduling on startup
 
-  // Enable motors
   digitalWrite(ENABLE_PIN, LOW);
   motorsEnabled = true;
-  lastPIDTime = millis();
-  lastLCDTime = millis();
+  lastPIDTime   = millis();
+  lastLCDTime   = millis();
   Serial.println("[INFO] Running.");
+}
+
+// ============================================================
+// SRF05 — returns distance in cm, 0 if out of range / no echo
+// Uses micros() instead of pulseIn() — pulseIn() uses a tight assembly
+// counting loop that gets corrupted by the Timer1 ISR firing every 100us.
+// micros() is Timer0-based and works correctly regardless of Timer1.
+// ============================================================
+int readSRF05() {
+  // 10us trigger pulse
+  digitalWrite(SRF05_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(SRF05_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(SRF05_TRIG_PIN, LOW);
+
+  // Wait for ECHO to go HIGH (timeout 5ms — sensor not responding)
+  unsigned long t0 = micros();
+  while (digitalRead(SRF05_ECHO_PIN) == LOW) {
+    if ((micros() - t0) > 5000UL) return 0;
+  }
+
+  // Measure how long ECHO stays HIGH
+  unsigned long echoStart = micros();
+  while (digitalRead(SRF05_ECHO_PIN) == HIGH) {
+    if ((micros() - echoStart) > (unsigned long)SRF05_TIMEOUT_US) return 0;
+  }
+
+  long duration = (long)(micros() - echoStart);
+  return (int)(duration / 58L);   // us -> cm
 }
 
 // ============================================================
 // LCD UPDATE — called every 250ms, non-blocking
 // ============================================================
-void updateLCD(float angle, float error, int speed, long pos, bool fallen) {
+void updateLCD(float angle, float odo, int dist, bool fallen, bool highGain, char motorDir) {
   char buf[17];
   char abuf[8];
 
@@ -302,15 +434,19 @@ void updateLCD(float angle, float error, int speed, long pos, bool fallen) {
     return;
   }
 
-  // Line 1: "A:-1.23 G:LOW  " (16 chars)
+  // Line 1: "A:-1.23 G:L M:F" (16 chars)
   dtostrf(angle, 6, 2, abuf);
-  bool isLow = (abs(error) < GAIN_SWITCH_ANGLE);
-  snprintf(buf, sizeof(buf), "A:%s G:%-3s  ", abuf, isLow ? "LOW" : "HI");
+  snprintf(buf, sizeof(buf), "A:%s G:%c M:%c", abuf, highGain ? 'H' : 'L', motorDir);
   lcd.print(buf);
 
-  // Line 2: "S:4000  P:02756 " (16 chars)
+  // Line 2: "O:-123cm D: 45cm" (16 chars)
+  //   O: odometry (cm from home), D: SRF05 distance
   lcd.setCursor(0, 1);
-  snprintf(buf, sizeof(buf), "S:%-4d  P:%-5ld ", speed, pos);
+  if (dist > 0) {
+    snprintf(buf, sizeof(buf), "O:%4dcm D:%3dcm", (int)odo, dist);
+  } else {
+    snprintf(buf, sizeof(buf), "O:%4dcm D:---cm", (int)odo);
+  }
   lcd.print(buf);
 }
 
@@ -339,6 +475,12 @@ void setMotorDirections(int speed) {
 void loop() {
   unsigned long now = millis();
 
+  // --- SRF05: read every SRF05_INTERVAL_MS (decoupled from PID rate) ---
+  if (now - lastSRFTime >= SRF05_INTERVAL_MS) {
+    lastSRFTime = now;
+    distanceCm  = readSRF05();
+  }
+
   if (now - lastPIDTime < PID_INTERVAL_MS) return;
 
   float dt = (now - lastPIDTime) / 1000.0f;
@@ -364,22 +506,30 @@ void loop() {
 
   // --- Re-enable after recovery ---
   if (hasFallen && abs(smoothedAngle) < 5.0f) {
-    hasFallen = false;
+    hasFallen     = false;
     motorsEnabled = true;
-    cli();
-    positionSteps = 0;
-    sei();  // Reset position origin on recovery
+    cli(); positionSteps = 0; sei();  // Reset position origin on recovery
+    homeIntegral  = 0.0f;            // Reset home PI integral
+    useHighGain   = false;           // Reset gain scheduling on recovery
     digitalWrite(ENABLE_PIN, LOW);
   }
 
   if (!motorsEnabled) return;
 
-  // --- Position hold: nudge setpoint to pull robot back to origin ---
+  // --- Return to home: outer PI cascade controller ---
+  // odoCm > 0 = robot ahead of home; < 0 = robot behind home
   cli();
   long posSnap = positionSteps;
   sei();
-  float posCorrection = constrain(-POS_HOLD_GAIN * (float)posSnap,
-                                  -POS_HOLD_MAX, POS_HOLD_MAX);
+  float odoCm = (float)posSnap * (PI * WHEEL_DIAMETER_MM)
+                / (200.0f * MICROSTEP * 10.0f);
+
+  homeIntegral += odoCm * dt;
+  homeIntegral  = constrain(homeIntegral, -HOME_I_LIMIT, HOME_I_LIMIT);
+  float posCorrection = constrain(
+    +(HOME_KP * odoCm + HOME_KI * homeIntegral),
+    -HOME_MAX_DEG, HOME_MAX_DEG
+  );
 
   // --- PID calculation ---
   float error = (setpoint + posCorrection) - smoothedAngle;
@@ -393,10 +543,21 @@ void loop() {
   dFiltered += DTERM_LPF_ALPHA * (dRaw - dFiltered);
   prevError = error;
 
-  // --- Gain scheduling: pick LOW or HIGH set based on error magnitude ---
-  float Kp_active = (abs(error) < GAIN_SWITCH_ANGLE) ? Kp_low : Kp_high;
-  float Ki_active = (abs(error) < GAIN_SWITCH_ANGLE) ? Ki_low : Ki_high;
-  float Kd_active = (abs(error) < GAIN_SWITCH_ANGLE) ? Kd_low : Kd_high;
+  // --- Gain scheduling with hysteresis ---
+  // Prevents oscillation between LOW and HIGH near the threshold
+  // HIGH: when |error| crosses GAIN_SWITCH_ANGLE + HYSTERESIS_BAND
+  // LOW:  when |error| drops below GAIN_SWITCH_ANGLE - HYSTERESIS_BAND
+  float absError = abs(error);
+  if (absError > (GAIN_SWITCH_ANGLE + HYSTERESIS_BAND)) {
+    useHighGain = true;   // Far from balance -> aggressive
+  } else if (absError < (GAIN_SWITCH_ANGLE - HYSTERESIS_BAND)) {
+    useHighGain = false;  // Close to balance -> soft
+  }
+  // else: stay in current state (hysteresis band)
+
+  float Kp_active = useHighGain ? Kp_high : Kp_low;
+  float Ki_active = useHighGain ? Ki_high : Ki_low;
+  float Kd_active = useHighGain ? Kd_high : Kd_low;
 
   float pidOut = Kp_active * error + Ki_active * integral + Kd_active * dFiltered;
   pidOut = constrain(pidOut, -(float)MAX_SPEED, (float)MAX_SPEED);
@@ -404,6 +565,13 @@ void loop() {
   // --- Dead band: cut tiny outputs that only cause jitter ---
   if (abs(pidOut) < DEAD_BAND) {
     pidOut = 0;
+  }
+
+  char motorDir = 'S';
+  if (pidOut > 0) {
+    motorDir = 'F';
+  } else if (pidOut < 0) {
+    motorDir = 'B';
   }
 
   int newSpeed = (int)abs(pidOut);
@@ -421,7 +589,7 @@ void loop() {
   // --- LCD update (every 250ms — non-blocking) ---
   if (now - lastLCDTime >= 250) {
     lastLCDTime = now;
-    updateLCD(smoothedAngle, error, newSpeed, posSnap, hasFallen);
+    updateLCD(smoothedAngle, odoCm, distanceCm, hasFallen, useHighGain, motorDir);
   }
 
   // --- Debug output (comment out to reduce loop time) ---
@@ -435,8 +603,11 @@ void loop() {
   Serial.print(dFiltered, 2);
   Serial.print(" S:");
   Serial.print(newSpeed);
-  Serial.print(" P:");
-  Serial.print(posSnap);
-  Serial.print(" G:");
-  Serial.println((abs(error) < GAIN_SWITCH_ANGLE) ? "LOW" : "HIGH");
+  Serial.print(" Odo:");
+  Serial.print(odoCm, 1);
+  Serial.print("cm SRF:");
+  Serial.print(distanceCm);
+  Serial.print("cm G:");
+  Serial.print(useHighGain ? "HIGH" : "LOW");
+  Serial.println();
 }
